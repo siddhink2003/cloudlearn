@@ -1,0 +1,4 @@
+/* Admin dashboard: statistics and user management */
+async function admV(){const[st,us]=await Promise.all([api('/admin/stats'),api('/admin/users')]);
+ return `<h2>Platform overview</h2><div class=g>${Object.entries(st).map(([k,v])=>`<div class="card stat"><div class=mu>${E(k)}</div><b>${v}</b></div>`).join('')}</div><h3>Users</h3><div class=card style="overflow-x:auto"><table><tr><th>Name</th><th>Email</th><th>Role</th><th>Status</th><th></th></tr>${us.map(u=>`<tr><td>${E(u.name)}</td><td>${E(u.email)}</td><td>${u.role}</td><td>${u.status}</td><td><button class=s onclick="us(${u.user_id},'${u.status=='active'?'inactive':'active'}')">${u.status=='active'?'Deactivate':'Activate'}</button></td></tr>`).join('')}</table></div>`}
+const us=(id,s)=>act(async()=>{await api('/admin/users/'+id+'/status','PUT',{status:s});R()});
