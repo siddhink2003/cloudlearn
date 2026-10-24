@@ -1,3 +1,9 @@
-node_modules
+
+node_modules/
 .env
-public/uploads
+.env.*
+!.env.example
+public/uploads/
+coverage/
+npm-debug.log*
+.DS_Store

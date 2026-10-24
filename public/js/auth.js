@@ -2,8 +2,12 @@
 function authV(){const reg=V.auth=='reg';
  return `<div class=auth-wrap><section class=auth-hero><span class=br><span class=logo>▶</span>CloudLearn</span><h1>Learn at your pace.<br>Pick up exactly where you stopped.</h1><ul><li>▶ Video resume remembers every lecture</li><li>🧪 Hands-on labs with instructor feedback</li><li>📝 Quizzes with instant results</li><li>📈 Progress tracking across all courses</li></ul></section>
  <section class=auth-form><div class=seg><button class="s ${reg?'':'on'}" onclick="V.auth='login';R()">Log in</button><button class="s ${reg?'on':''}" onclick="V.auth='reg';R()">Create account</button></div>`
- +(reg?`<h2>Create your account</h2><label for=rn>Full name</label><input id=rn><label for=re>Email</label><input id=re type=email><label for=rp>Password (6+ characters)</label><input id=rp type=password><label for=rr>I am a</label><select id=rr><option value=student>Student</option><option value=instructor>Instructor</option></select><button class=wide onclick=reg()>Create account</button>`
+ +(reg?`<h2>Create your account</h2><label for=rn>Full name</label><input id=rn><label for=re>Email</label><input id=re type=email><label for=rp>Password (6+ characters)</label><input id=rp type=password></select><button class=wide onclick=reg()>Create account</button>`
  :`<h2>Welcome back</h2><label for=e>Email</label><input id=e type=email><label for=p>Password</label><input id=p type=password><button class=wide onclick="login()">Log in</button><p class=hint>After running the seed script, try student@demo.com, instructor@demo.com or admin@demo.com with password demo123.</p>`)+`</section></div>`}
 const login=(e,p)=>act(async()=>{const d=await api('/login','POST',{email:e||$('#e').value,password:p||$('#p').value});tok=d.token;U={name:d.name,role:d.role};localStorage.setItem('cl_tok',tok);localStorage.setItem('cl_user',JSON.stringify(U));go('home')});
-const reg=()=>act(async()=>{const em=$('#re').value,pw=$('#rp').value;await api('/register','POST',{name:$('#rn').value,email:em,password:pw,role:$('#rr').value});await login(em,pw)});
+await api('/register', 'POST', {
+  name: $('#rn').value,
+  email: em,
+  password: pw
+});
 function out(){savePos();tok=null;U=null;lp=null;localStorage.removeItem('cl_tok');localStorage.removeItem('cl_user');R()}

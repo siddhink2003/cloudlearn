@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express'), mysql = require('mysql2/promise'), bcrypt = require('bcryptjs'),
   jwt = require('jsonwebtoken'), path = require('path');
 const multer = require('multer'), fs = require('fs');
+const { gradePython, gradeJava } = require('./lab-runner/service/runner');
 const upDir = path.join(__dirname, 'public', 'uploads'); fs.mkdirSync(upDir, { recursive: true });
 const upload = multer({ storage: multer.diskStorage({ destination: upDir, filename: (q, f, cb) => cb(null, Date.now() + '-' + f.originalname.replace(/[^\w.\-]/g, '_')) }),
   limits: { fileSize: 10 * 1024 * 1024 }, fileFilter: (q, f, cb) => cb(null, /\.(pdf|docx|zip|png|jpe?g|txt)$/i.test(f.originalname)) });
@@ -24,14 +25,117 @@ const one = async (sql, p) => (await db.query(sql, p))[0][0];
 app.get('/api/health', wrap(async (q, s) => { await db.query('SELECT 1'); s.json({ ok: true }); }));
 
 /* Auth */
+
+/* Python coding exercise execution */
+app.post('/api/labs/:id/execute',
+  auth('student'),
+  wrap(async (q, s) => {
+    const labId = Number(q.params.id);
+    const source = q.body?.code;
+
+    if (!Number.isSafeInteger(labId) || labId <= 0) {
+      return s.status(400).json({ error: 'Invalid lab ID.' });
+    }
+
+    if (typeof source !== 'string' || !source.trim()) {
+  return s.status(400).json({ error: 'Source code is required.' });
+}
+
+    // Confirm the lab exists and the student is enrolled in its course.
+    const lab = await one(`
+      SELECT l.lab_id
+      FROM labs l
+      JOIN lessons le ON le.lesson_id = l.lesson_id
+      JOIN enrollments e ON e.course_id = le.course_id
+      WHERE l.lab_id = ? AND e.student_id = ?
+    `, [labId, q.user.id]);
+
+    if (!lab) {
+      return s.status(403).json({
+        error: 'Lab not found or you are not enrolled in its course.'
+      });
+    }
+
+    // Only Python exercises are supported by this runner.
+    const exercise = await one(`
+      SELECT language, test_cases
+      FROM coding_exercises
+      WHERE lab_id = ?
+    `, [labId]);
+
+    if (!exercise) {
+      return s.status(404).json({
+        error: 'No coding exercise is configured for this lab.'
+      });
+    }
+
+if (!['python', 'java'].includes(exercise.language)) {
+  return s.status(400).json({
+    error: 'This exercise language is not supported.'
+  });
+}
+
+
+    let testCases;
+    try {
+      testCases = typeof exercise.test_cases === 'string'
+        ? JSON.parse(exercise.test_cases)
+        : exercise.test_cases;
+    } catch {
+      return s.status(500).json({
+        error: 'Exercise test configuration is invalid.'
+      });
+    }
+
+const result = exercise.language === 'java'
+  ? await gradeJava(source, testCases)
+  : await gradePython(source, testCases);
+
+    if (!result.success) {
+      return s.status(400).json({
+        error: result.error || 'Execution failed.'
+      });
+    }
+
+    // Do not expose hidden expected outputs or test inputs.
+    return s.json({
+      passed: result.passed,
+      total: result.total,
+      results: result.results
+    });
+  })
+);
+
+/* Auth */
+
+
+/* Public registration creates student accounts only */
 app.post('/api/register', wrap(async (q, s) => {
-  const { name, email, password, role } = q.body;
-  if (!name || !email || !password || password.length < 6) return s.status(400).json({ error: 'Name, email and a 6+ character password are required' });
-  if (await one('SELECT 1 FROM users WHERE email=?', [email])) return s.status(409).json({ error: 'Email already registered' });
-  await db.query('INSERT INTO users (name,email,password_hash,role) VALUES (?,?,?,?)',
-    [name, email.toLowerCase(), await bcrypt.hash(password, 10), role === 'instructor' ? 'instructor' : 'student']);
+  const name = (q.body.name || '').trim();
+  const email = (q.body.email || '').trim().toLowerCase();
+  const password = q.body.password || '';
+
+  if (!name || !email || password.length < 6) {
+    return s.status(400).json({
+      error: 'Name, email and a 6+ character password are required'
+    });
+  }
+
+  if (await one('SELECT 1 FROM users WHERE email=?', [email])) {
+    return s.status(409).json({
+      error: 'Email already registered'
+    });
+  }
+
+  await db.query(
+    'INSERT INTO users (name,email,password_hash,role) VALUES (?,?,?,?)',
+    [name, email, await bcrypt.hash(password, 10), 'student']
+  );
+
   s.status(201).json({ ok: true });
 }));
+
+
 app.post('/api/login', wrap(async (q, s) => {
   const u = await one('SELECT * FROM users WHERE email=? AND status="active"', [(q.body.email || '').toLowerCase()]);
   if (!u || !(await bcrypt.compare(q.body.password || '', u.password_hash))) return s.status(401).json({ error: 'Invalid credentials' });
@@ -113,30 +217,171 @@ app.get('/api/instructor/submissions', auth('instructor', 'admin'), wrap(async (
     JOIN labs lb ON lb.lab_id=sb.lab_id JOIN lessons l ON l.lesson_id=lb.lesson_id JOIN courses c ON c.course_id=l.course_id
     JOIN users u ON u.user_id=sb.student_id WHERE c.instructor_id=? OR ?='admin' ORDER BY sb.submitted_at DESC`, [q.user.id, q.user.role]))[0]);
 }));
-app.put('/api/submissions/:id/grade', auth('instructor', 'admin'), wrap(async (q, s) => {
-  await db.query('UPDATE lab_submissions SET marks=?, feedback=?, status="graded" WHERE submission_id=?', [q.body.marks, q.body.feedback, q.params.id]);
-  s.json({ ok: true });
-}));
+
+app.put('/api/submissions/:id/grade',
+  auth('instructor', 'admin'),
+  wrap(async (q, s) => {
+    const marks = Number(q.body.marks);
+    const feedback = q.body.feedback ?? '';
+
+    if (!Number.isFinite(marks) || typeof feedback !== 'string') {
+      return s.status(400).json({ error: 'Invalid marks or feedback' });
+    }
+
+    const submission = await one(`
+      SELECT sb.submission_id, lb.max_marks, c.instructor_id
+      FROM lab_submissions sb
+      JOIN labs lb ON lb.lab_id = sb.lab_id
+      JOIN lessons l ON l.lesson_id = lb.lesson_id
+      JOIN courses c ON c.course_id = l.course_id
+      WHERE sb.submission_id = ?
+    `, [q.params.id]);
+
+    if (!submission) {
+      return s.status(404).json({ error: 'Submission not found' });
+    }
+
+    if (
+      q.user.role !== 'admin' &&
+      submission.instructor_id !== q.user.id
+    ) {
+      return s.status(403).json({ error: 'Not your course' });
+    }
+
+    if (marks < 0 || marks > submission.max_marks) {
+      return s.status(400).json({
+        error: `Marks must be between 0 and ${submission.max_marks}`
+      });
+    }
+
+    await db.query(
+      'UPDATE lab_submissions SET marks=?, feedback=?, status="graded" WHERE submission_id=?',
+      [marks, feedback, submission.submission_id]
+    );
+
+    s.json({ ok: true });
+  })
+);
+
+
+/* Quizzes */
 
 /* Quizzes */
 app.get('/api/lessons/:id/quiz', auth(), wrap(async (q, s) => {
-  const z = await one('SELECT * FROM quizzes WHERE lesson_id=?', [q.params.id]);
+  const lesson = await one(
+    'SELECT lesson_id, course_id FROM lessons WHERE lesson_id=?',
+    [q.params.id]
+  );
+
+  if (!lesson) {
+    return s.status(404).json({ error: 'Lesson not found' });
+  }
+
+  if (q.user.role === 'student') {
+    const enrollment = await one(
+      'SELECT 1 FROM enrollments WHERE student_id=? AND course_id=?',
+      [q.user.id, lesson.course_id]
+    );
+
+    if (!enrollment) {
+      return s.status(403).json({ error: 'Enroll first' });
+    }
+  }
+
+  const z = await one(
+    'SELECT * FROM quizzes WHERE lesson_id=?',
+    [q.params.id]
+  );
+
   if (!z) return s.json(null);
-  z.questions = (await db.query('SELECT question_id, question_text, options, marks FROM quiz_questions WHERE quiz_id=?', [z.quiz_id]))[0];
-  z.last = await one('SELECT score,total,attempt_no FROM quiz_results WHERE quiz_id=? AND student_id=? ORDER BY result_id DESC LIMIT 1', [z.quiz_id, q.user.id]) || null;
+
+  z.questions = (await db.query(
+    'SELECT question_id, question_text, options, marks FROM quiz_questions WHERE quiz_id=?',
+    [z.quiz_id]
+  ))[0];
+
+  z.last = await one(
+    'SELECT score,total,attempt_no FROM quiz_results WHERE quiz_id=? AND student_id=? ORDER BY result_id DESC LIMIT 1',
+    [z.quiz_id, q.user.id]
+  ) || null;
+
   s.json(z);
 }));
+
 app.post('/api/quizzes/:id/attempt', auth('student'), wrap(async (q, s) => {
-  const z = await one('SELECT * FROM quizzes WHERE quiz_id=?', [q.params.id]);
-  const n = (await one('SELECT COUNT(*) AS n FROM quiz_results WHERE quiz_id=? AND student_id=?', [q.params.id, q.user.id])).n;
-  if (n >= z.max_attempts) return s.status(403).json({ error: 'No attempts left' });
-  const qs = (await db.query('SELECT question_id, correct_option, marks FROM quiz_questions WHERE quiz_id=?', [q.params.id]))[0];
-  let score = 0, total = 0;
-  qs.forEach(x => { total += x.marks; if (+(q.body.answers || {})[x.question_id] === x.correct_option) score += x.marks; });
-  await db.query('INSERT INTO quiz_results (quiz_id,student_id,score,total,attempt_no) VALUES (?,?,?,?,?)', [q.params.id, q.user.id, score, total, n + 1]);
-  s.json({ score, total, passed: total ? (100 * score / total) >= z.pass_score : false,
-    correct: Object.fromEntries(qs.map(x => [x.question_id, x.correct_option])) });
+  const z = await one(
+    'SELECT * FROM quizzes WHERE quiz_id=?',
+    [q.params.id]
+  );
+
+  if (!z) {
+    return s.status(404).json({ error: 'Quiz not found' });
+  }
+
+  const enrollment = await one(
+    'SELECT 1 FROM enrollments e JOIN lessons l ON l.course_id=e.course_id WHERE e.student_id=? AND l.lesson_id=?',
+    [q.user.id, z.lesson_id]
+  );
+
+  if (!enrollment) {
+    return s.status(403).json({ error: 'Enroll first' });
+  }
+
+  const count = await one(
+    'SELECT COUNT(*) AS n FROM quiz_results WHERE quiz_id=? AND student_id=?',
+    [z.quiz_id, q.user.id]
+  );
+
+  if (count.n >= z.max_attempts) {
+    return s.status(403).json({ error: 'No attempts left' });
+  }
+
+  const questions = (await db.query(
+    'SELECT question_id, correct_option, marks FROM quiz_questions WHERE quiz_id=?',
+    [z.quiz_id]
+  ))[0];
+
+  if (!questions.length) {
+    return s.status(400).json({ error: 'Quiz has no questions' });
+  }
+
+  const answers = q.body.answers;
+
+  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) {
+    return s.status(400).json({ error: 'Answers must be an object' });
+  }
+
+  const validIds = new Set(questions.map(x => String(x.question_id)));
+
+  if (Object.keys(answers).some(id => !validIds.has(id))) {
+    return s.status(400).json({ error: 'Invalid question ID' });
+  }
+
+  let score = 0;
+  let total = 0;
+
+  questions.forEach(x => {
+    total += x.marks;
+    if (Number(answers[x.question_id]) === x.correct_option) {
+      score += x.marks;
+    }
+  });
+
+  await db.query(
+    'INSERT INTO quiz_results (quiz_id,student_id,score,total,attempt_no) VALUES (?,?,?,?,?)',
+    [z.quiz_id, q.user.id, score, total, count.n + 1]
+  );
+
+  s.json({
+    score,
+    total,
+    passed: total > 0 && (100 * score / total) >= z.pass_score,
+    correct: Object.fromEntries(
+      questions.map(x => [x.question_id, x.correct_option])
+    )
+  });
 }));
+
 
 /* Extra routes used by the frontend */
 app.get('/api/lessons/:id', auth(), wrap(async (q, s) => {
