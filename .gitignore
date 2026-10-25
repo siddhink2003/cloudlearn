@@ -7,3 +7,4 @@ public/uploads/
 coverage/
 npm-debug.log*
 .DS_Store
+public/js/admin.js.backup
