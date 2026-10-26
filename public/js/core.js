@@ -14,7 +14,11 @@ function go(n,a,b,v){savePos();lp=null;V={n,a,b,v};R();scrollTo(0,0)}
 async function R(){const a=$('#app');if(!tok){a.innerHTML=authV();return}
  try{const v={home:U.role=='student'?stuV:U.role=='instructor'?insV:admV,course:crsV,lesson:lesV}[V.n];const h=await v();
   a.innerHTML=`<header><div class=bar-in><span class=br onclick="go('home')"><span class=logo>▶</span>CloudLearn</span><span class=user><span class=av>${E(U.name[0])}</span><span class=ut><b>${E(U.name)}</b><small>${U.role}</small></span><button class=s onclick=out()>Log out</button></span></div></header><main>${h}</main><footer>CloudLearn · Node.js + MySQL on Microsoft Azure</footer>`;
-  if(V.n=='lesson')initP()}catch(e){if(tok)a.innerHTML=`<main><p>${E(e.message)}</p><button onclick="go('home')">Home</button></main>`}}
+  if (V.n === 'lesson') {
+  loadYouTubeAPI()
+    .then(() => initP())
+    .catch(err => console.error('YouTube API failed to load:', err));
+}}catch(e){if(tok)a.innerHTML=`<main><p>${E(e.message)}</p><button onclick="go('home')">Home</button></main>`}}
 
 /* helpers for visuals */
 const grad=s=>{let h=0;for(const c of String(s))h=(h*31+c.charCodeAt(0))%360;return `linear-gradient(135deg,hsl(${h} 62% 34%),hsl(${(h+45)%360} 68% 50%))`};

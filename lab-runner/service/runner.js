@@ -256,7 +256,6 @@ async function runJava(source, input = "") {
 
   return new Promise((resolve) => {
     const encoded = Buffer.from(source, "utf8").toString("base64");
-    const encodedInput = Buffer.from(input, "utf8").toString("base64");
 
     const child = docker([
       "run", "--name", name, "-i",
@@ -273,7 +272,7 @@ async function runJava(source, input = "") {
       "--entrypoint", "sh",
       "cloudlearn-java-runner:local",
       "-c",
-      "base64 -d > /work/Main.java && javac -d /tmp /work/Main.java && java -cp /tmp Main"
+      "IFS= read -r encoded_source || exit 1; printf '%s' \"$encoded_source\" | base64 -d > /work/Main.java && javac -d /tmp /work/Main.java && java -cp /tmp Main"
     ]);
 
     let output = "";
@@ -316,7 +315,7 @@ async function runJava(source, input = "") {
       finish(null, "Java execution timed out.");
     }, TIMEOUT_MS);
 
-    child.stdin.end(encoded + "\n" + encodedInput + "\n");
+    child.stdin.end(encoded + "\n" + input);
   });
 }
 

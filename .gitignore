@@ -8,3 +8,4 @@ coverage/
 npm-debug.log*
 .DS_Store
 public/js/admin.js.backup
+public/js/instructor.js.bak

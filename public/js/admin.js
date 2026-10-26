@@ -19,6 +19,26 @@ async function admV() {
       `).join('')}
     </div>
 
+    <h3>Add Instructor</h3>
+    <div class="card">
+      <form id="addInstructorForm">
+        <label for="instructorName">Full name</label>
+        <input id="instructorName" name="name" type="text"
+          maxlength="100" required>
+
+        <label for="instructorEmail">Email address</label>
+        <input id="instructorEmail" name="email" type="email"
+          maxlength="150" required>
+
+        <label for="instructorPassword">Initial password</label>
+        <input id="instructorPassword" name="password" type="password"
+          minlength="8" maxlength="72" required>
+
+        <button type="submit">Create Instructor</button>
+      </form>
+      <p id="instructorMessage" role="status" aria-live="polite"></p>
+    </div>
+
     <h3>Users</h3>
     <div class="card" style="overflow-x:auto">
       <table>
@@ -88,4 +108,34 @@ const deleteCourse = id => act(async () => {
 
   await api('/courses/' + id, 'DELETE');
   R();
+});
+
+document.addEventListener('submit', async event => {
+  if (event.target.id !== 'addInstructorForm') return;
+
+  event.preventDefault();
+
+  const form = event.target;
+  const message = document.getElementById('instructorMessage');
+  const button = form.querySelector('button[type="submit"]');
+
+  const data = {
+    name: form.elements.name.value.trim(),
+    email: form.elements.email.value.trim(),
+    password: form.elements.password.value
+  };
+
+  button.disabled = true;
+  message.textContent = 'Creating instructor account...';
+
+  try {
+    const result = await api('/admin/instructors', 'POST', data);
+
+    form.reset();
+    R();
+  } catch (error) {
+    message.textContent = error.message || 'Could not create instructor.';
+  } finally {
+    button.disabled = false;
+  }
 });

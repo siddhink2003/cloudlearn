@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express'), mysql = require('mysql2/promise'), bcrypt = require('bcryptjs'),
   jwt = require('jsonwebtoken'), path = require('path');
 const multer = require('multer'), fs = require('fs');
-const { gradePython, gradeJava } = require('./lab-runner/service/runner');
+const { runPython, gradePython, runJava, gradeJava } = require('./lab-runner/service/runner');
 const upDir = path.join(__dirname, 'public', 'uploads'); fs.mkdirSync(upDir, { recursive: true });
 const upload = multer({ storage: multer.diskStorage({ destination: upDir, filename: (q, f, cb) => cb(null, Date.now() + '-' + f.originalname.replace(/[^\w.\-]/g, '_')) }),
   limits: { fileSize: 10 * 1024 * 1024 }, fileFilter: (q, f, cb) => cb(null, /\.(pdf|docx|zip|png|jpe?g|txt)$/i.test(f.originalname)) });
@@ -25,6 +25,78 @@ const one = async (sql, p) => (await db.query(sql, p))[0][0];
 app.get('/api/health', wrap(async (q, s) => { await db.query('SELECT 1'); s.json({ ok: true }); }));
 
 /* Auth */
+
+
+/* Run code in the isolated Docker runner */
+app.post('/api/labs/:id/run',
+  auth('student'),
+  wrap(async (q, s) => {
+    const labId = Number(q.params.id);
+    const source = q.body?.code;
+    const input = q.body?.input ?? '';
+    const language = q.body?.language;
+
+    if (!Number.isSafeInteger(labId) || labId <= 0) {
+      return s.status(400).json({ error: 'Invalid lab ID.' });
+    }
+
+    if (typeof source !== 'string' || !source.trim()) {
+      return s.status(400).json({ error: 'Enter some code first.' });
+    }
+
+    if (typeof input !== 'string') {
+      return s.status(400).json({ error: 'Input must be text.' });
+    }
+
+    if (!['python', 'java'].includes(language)) {
+      return s.status(400).json({ error: 'Choose Python or Java.' });
+    }
+
+    const lab = await one(`
+      SELECT l.lab_id
+      FROM labs l
+      JOIN lessons le ON le.lesson_id = l.lesson_id
+      JOIN enrollments e ON e.course_id = le.course_id
+      WHERE l.lab_id = ? AND e.student_id = ?
+    `, [labId, q.user.id]);
+
+    if (!lab) {
+      return s.status(403).json({
+        error: 'Lab not found or you are not enrolled in its course.'
+      });
+    }
+
+    const exercise = await one(
+      'SELECT language FROM coding_exercises WHERE lab_id = ?',
+      [labId]
+    );
+
+    if (!exercise) {
+      return s.status(404).json({
+        error: 'No coding exercise is configured for this lab.'
+      });
+    }
+
+
+    const result = language === 'java'
+      ? await runJava(source, input)
+      : await runPython(source, input);
+
+    if (result.cleanupConfirmed !== true) {
+      return s.status(500).json({
+        error: 'Execution failed or container cleanup could not be confirmed.',
+        output: result.output || ''
+      });
+    }
+
+    return s.json({
+      success: result.success,
+      output: result.output || '',
+      error: result.error || null
+    });
+  })
+);
+
 
 /* Python coding exercise execution */
 app.post('/api/labs/:id/execute',
@@ -161,20 +233,139 @@ app.post('/api/courses', auth('instructor', 'admin'), wrap(async (q, s) => {
   s.status(201).json({ course_id: r[0].insertId });
 }));
 app.post('/api/courses/:id/lessons', auth('instructor', 'admin'), wrap(async (q, s) => {
-  const c = await one('SELECT instructor_id FROM courses WHERE course_id=?', [q.params.id]);
-  if (!c || (c.instructor_id !== q.user.id && q.user.role !== 'admin')) return s.status(403).json({ error: 'Not your course' });
-  const b = q.body, n = (await one('SELECT COUNT(*)+1 AS n FROM lessons WHERE course_id=?', [q.params.id])).n;
-  const r = await db.query('INSERT INTO lessons (course_id,title,video_url,duration_seconds,order_no) VALUES (?,?,?,?,?)',
-    [q.params.id, b.title, b.video_url, b.duration_seconds || 0, n]);
-  const id = r[0].insertId;
-  for (const m of b.materials || []) if (m.title) await db.query('INSERT INTO materials (lesson_id,title,file_url) VALUES (?,?,?)', [id, m.title, m.file_url]);
-  if (b.lab) await db.query('INSERT INTO labs (lesson_id,title,instructions,video_url,deadline,max_marks) VALUES (?,?,?,?,?,?)',
-    [id, b.lab.title, b.lab.instructions, b.lab.video_url, b.lab.deadline || null, b.lab.max_marks || 20]);
-  if (b.quiz && b.quiz.questions && b.quiz.questions.length) {
-    const qz = await db.query('INSERT INTO quizzes (course_id,lesson_id,title) VALUES (?,?,?)', [q.params.id, id, b.quiz.title || b.title + ' quiz']);
-    for (const x of b.quiz.questions) await db.query('INSERT INTO quiz_questions (quiz_id,question_text,options,correct_option) VALUES (?,?,?,?)',
-      [qz[0].insertId, x.question, JSON.stringify(x.options), x.correct]);
+  const c = await one(
+    'SELECT instructor_id FROM courses WHERE course_id=?',
+    [q.params.id]
+  );
+
+  if (!c || (c.instructor_id !== q.user.id && q.user.role !== 'admin')) {
+    return s.status(403).json({ error: 'Not your course' });
   }
+
+  const b = q.body;
+
+  if (!b.title || !String(b.title).trim()) {
+    return s.status(400).json({ error: 'Lesson title is required' });
+  }
+
+  // Validate coding exercise before inserting the lesson.
+  let codingExercise = null;
+
+  if (b.coding_exercise) {
+    const ce = b.coding_exercise;
+
+    if (!b.lab || !b.lab.title || !String(b.lab.title).trim()) {
+      return s.status(400).json({
+        error: 'A lab title is required for a coding exercise'
+      });
+    }
+
+    if (!['python', 'java'].includes(ce.language)) {
+      return s.status(400).json({
+        error: 'Coding language must be python or java'
+      });
+    }
+
+    if (!Array.isArray(ce.test_cases) ||
+        ce.test_cases.length < 1 ||
+        ce.test_cases.length > 20) {
+      return s.status(400).json({
+        error: 'Provide between 1 and 20 coding test cases'
+      });
+    }
+
+    const validCases = ce.test_cases.every(tc =>
+      tc &&
+      typeof tc.input === 'string' &&
+      typeof tc.expected === 'string'
+    );
+
+    if (!validCases) {
+      return s.status(400).json({
+        error: 'Each test case must contain string input and expected values'
+      });
+    }
+
+    codingExercise = ce;
+  }
+
+  const order = await one(
+    'SELECT COUNT(*)+1 AS n FROM lessons WHERE course_id=?',
+    [q.params.id]
+  );
+
+  const r = await db.query(
+    'INSERT INTO lessons (course_id,title,video_url,duration_seconds,order_no) VALUES (?,?,?,?,?)',
+    [
+      q.params.id,
+      String(b.title).trim(),
+      b.video_url || null,
+      b.duration_seconds || 0,
+      order.n
+    ]
+  );
+
+  const id = r[0].insertId;
+
+  // Save study materials.
+  for (const m of b.materials || []) {
+    if (m.title && String(m.title).trim()) {
+      await db.query(
+        'INSERT INTO materials (lesson_id,title,file_url) VALUES (?,?,?)',
+        [id, String(m.title).trim(), m.file_url || null]
+      );
+    }
+  }
+
+  // Save the lab and, if requested, its runnable coding exercise.
+  if (b.lab) {
+    const labResult = await db.query(
+      'INSERT INTO labs (lesson_id,title,instructions,video_url,deadline,max_marks) VALUES (?,?,?,?,?,?)',
+      [
+        id,
+        String(b.lab.title).trim(),
+        b.lab.instructions || '',
+        b.lab.video_url || null,
+        b.lab.deadline || null,
+        b.lab.max_marks || 20
+      ]
+    );
+
+    const labId = labResult[0].insertId;
+
+    if (codingExercise) {
+      await db.query(
+        'INSERT INTO coding_exercises (lab_id,language,starter_code,test_cases) VALUES (?,?,?,?)',
+        [
+          labId,
+          codingExercise.language,
+          codingExercise.starter_code || '',
+          JSON.stringify(codingExercise.test_cases)
+        ]
+      );
+    }
+  }
+
+  // Save the quiz and its questions.
+  if (b.quiz && Array.isArray(b.quiz.questions) && b.quiz.questions.length) {
+    const qz = await db.query(
+      'INSERT INTO quizzes (course_id,lesson_id,title) VALUES (?,?,?)',
+      [q.params.id, id, b.quiz.title || b.title + ' quiz']
+    );
+
+    for (const x of b.quiz.questions) {
+      await db.query(
+        'INSERT INTO quiz_questions (quiz_id,question_text,options,correct_option) VALUES (?,?,?,?)',
+        [
+          qz[0].insertId,
+          x.question,
+          JSON.stringify(x.options),
+          x.correct
+        ]
+      );
+    }
+  }
+
   s.status(201).json({ lesson_id: id });
 }));
 app.post('/api/courses/:id/enroll', auth('student'), wrap(async (q, s) => {
@@ -388,10 +579,29 @@ app.get('/api/lessons/:id', auth(), wrap(async (q, s) => {
   const l = await one('SELECT l.*, c.title AS course FROM lessons l JOIN courses c ON c.course_id=l.course_id WHERE l.lesson_id=?', [q.params.id]);
   if (!l) return s.status(404).json({ error: 'Not found' });
   if (q.user.role === 'student' && !(await one('SELECT 1 FROM enrollments WHERE student_id=? AND course_id=?', [q.user.id, l.course_id]))) return s.status(403).json({ error: 'Enroll first' });
-  l.materials = (await db.query('SELECT title,file_url FROM materials WHERE lesson_id=?', [l.lesson_id]))[0];
-  l.lab = (await one('SELECT * FROM labs WHERE lesson_id=?', [l.lesson_id])) || null;
-  if (l.lab) l.lab.submission = (await one('SELECT * FROM lab_submissions WHERE lab_id=? AND student_id=? ORDER BY submission_id DESC LIMIT 1', [l.lab.lab_id, q.user.id])) || null;
-  s.json(l);
+  l.materials = (await db.query(
+  'SELECT title,file_url FROM materials WHERE lesson_id=?',
+  [l.lesson_id]
+))[0];
+
+l.lab = (await one(
+  'SELECT * FROM labs WHERE lesson_id=?',
+  [l.lesson_id]
+)) || null;
+
+if (l.lab) {
+  l.lab.submission = (await one(
+    'SELECT * FROM lab_submissions WHERE lab_id=? AND student_id=? ORDER BY submission_id DESC LIMIT 1',
+    [l.lab.lab_id, q.user.id]
+  )) || null;
+
+  l.lab.coding_exercise = await one(
+    'SELECT language FROM coding_exercises WHERE lab_id=?',
+    [l.lab.lab_id]
+  );
+}
+
+s.json(l);
 }));
 app.get('/api/students/me/courses', auth('student'), wrap(async (q, s) => {
   s.json((await db.query(`SELECT c.course_id, c.title, c.category,
@@ -421,6 +631,64 @@ app.get('/api/admin/stats', auth('admin'), wrap(async (q, s) => {
 }));
 app.get('/api/admin/users', auth('admin'), wrap(async (q, s) => {
   s.json((await db.query('SELECT user_id,name,email,role,status,created_at FROM users'))[0]);
+}));
+
+app.post('/api/admin/instructors', auth('admin'), wrap(async (q, s) => {
+  const name = String(q.body.name || '').trim();
+  const email = String(q.body.email || '').trim().toLowerCase();
+  const password = String(q.body.password || '');
+
+  if (!name || name.length > 100) {
+    return s.status(400).json({
+      error: 'Name is required and must be at most 100 characters'
+    });
+  }
+
+  if (
+    email.length > 150 ||
+    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  ) {
+    return s.status(400).json({
+      error: 'Please provide a valid email address'
+    });
+  }
+
+  if (password.length < 8 || password.length > 72) {
+    return s.status(400).json({
+      error: 'Password must be between 8 and 72 characters'
+    });
+  }
+
+  const existing = await one(
+    'SELECT user_id FROM users WHERE email = ?',
+    [email]
+  );
+
+  if (existing) {
+    return s.status(409).json({
+      error: 'An account with this email already exists'
+    });
+  }
+
+  const passwordHash = await bcrypt.hash(password, 10);
+
+  const [result] = await db.query(
+    `INSERT INTO users (name, email, password_hash, role, status)
+     VALUES (?, ?, ?, 'instructor', 'active')`,
+    [name, email, passwordHash]
+  );
+
+  s.status(201).json({
+    ok: true,
+    message: 'Instructor account created successfully',
+    instructor: {
+      user_id: result.insertId,
+      name,
+      email,
+      role: 'instructor',
+      status: 'active'
+    }
+  });
 }));
 
 app.listen(process.env.PORT || 3000, () => console.log('CloudLearn running on port ' + (process.env.PORT || 3000)));
