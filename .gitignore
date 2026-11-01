@@ -9,3 +9,8 @@ npm-debug.log*
 .DS_Store
 public/js/admin.js.backup
 public/js/instructor.js.bak
+public/videos/server.js.before-blob-backup
+public/js/instructor.js.before-blob-backup
+public/videos/
+public/js/instructor.js.before-blob-backup
+server.js.before-blob-backup

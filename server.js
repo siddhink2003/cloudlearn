@@ -2,8 +2,80 @@ require('dotenv').config();
 const express = require('express'), mysql = require('mysql2/promise'), bcrypt = require('bcryptjs'),
   jwt = require('jsonwebtoken'), path = require('path');
 const multer = require('multer'), fs = require('fs');
+const { DefaultAzureCredential } = require('@azure/identity');
+const {
+  BlobServiceClient,
+  BlobSASPermissions,
+  generateBlobSASQueryParameters,
+  SASProtocol
+} = require('@azure/storage-blob');
 const { runPython, gradePython, runJava, gradeJava } = require('./lab-runner/service/runner');
 const upDir = path.join(__dirname, 'public', 'uploads'); fs.mkdirSync(upDir, { recursive: true });
+const videoDir = path.join(__dirname, 'public', 'videos');
+fs.mkdirSync(videoDir, { recursive: true });
+const storageAccount = process.env.AZURE_STORAGE_ACCOUNT;
+const videoContainer = process.env.AZURE_STORAGE_CONTAINER || 'course-videos';
+
+if (!storageAccount) {
+  throw new Error('AZURE_STORAGE_ACCOUNT is missing from the environment.');
+}
+
+const credential = new DefaultAzureCredential();
+
+const blobServiceClient = new BlobServiceClient(
+  `https://${storageAccount}.blob.core.windows.net`,
+  credential
+);
+
+const videoBlobContainer = blobServiceClient.getContainerClient(videoContainer);
+async function getPlayableVideoUrl(videoUrl) {
+  if (!videoUrl || !videoUrl.startsWith('azureblob:')) {
+    return videoUrl;
+  }
+
+  const blobName = videoUrl.slice('azureblob:'.length);
+  const now = new Date();
+  const startsOn = new Date(now.getTime() - 5 * 60 * 1000);
+  const expiresOn = new Date(now.getTime() + 60 * 60 * 1000);
+
+  const delegationKey = await blobServiceClient.getUserDelegationKey(
+    startsOn,
+    expiresOn
+  );
+
+  const sas = generateBlobSASQueryParameters(
+    {
+      containerName: videoContainer,
+      blobName,
+      permissions: BlobSASPermissions.parse('r'),
+      startsOn,
+      expiresOn,
+      protocol: SASProtocol.Https
+    },
+    delegationKey,
+    storageAccount
+  ).toString();
+
+  const blobClient = videoBlobContainer.getBlobClient(blobName);
+  return `${blobClient.url}?${sas}`;
+}
+const videoUpload = multer({
+  storage: multer.diskStorage({
+    destination: videoDir,
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname).toLowerCase();
+      cb(null, `${Date.now()}-${require('crypto').randomUUID()}${ext}`);
+    }
+  }),
+  limits: { fileSize: 500 * 1024 * 1024 }, // 500 MB maximum
+  fileFilter: (req, file, cb) => {
+    const allowed = new Set(['.mp4', '.webm', '.ogg']);
+    const ext = path.extname(file.originalname).toLowerCase();
+
+    if (allowed.has(ext)) return cb(null, true);
+    cb(new Error('Only MP4, WebM, and Ogg video files are allowed.'));
+  }
+});
 const upload = multer({ storage: multer.diskStorage({ destination: upDir, filename: (q, f, cb) => cb(null, Date.now() + '-' + f.originalname.replace(/[^\w.\-]/g, '_')) }),
   limits: { fileSize: 10 * 1024 * 1024 }, fileFilter: (q, f, cb) => cb(null, /\.(pdf|docx|zip|png|jpe?g|txt)$/i.test(f.originalname)) });
 const app = express();
@@ -21,7 +93,70 @@ const auth = (...roles) => (q, s, n) => {
   } catch (e) { s.status(401).json({ error: 'Login required' }); }
 };
 const one = async (sql, p) => (await db.query(sql, p))[0][0];
+app.post(
+  '/api/courses/:id/video-upload',
+  auth('instructor', 'admin'),
+  videoUpload.single('video'),
+  wrap(async (req, res) => {
+    let uploadedBlobName;
 
+    try {
+      const course = await one(
+        'SELECT instructor_id FROM courses WHERE course_id=?',
+        [req.params.id]
+      );
+
+      if (
+        !course ||
+        (Number(course.instructor_id) !== Number(req.user.id) &&
+          req.user.role !== 'admin')
+      ) {
+        return res.status(403).json({ error: 'Not your course' });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({ error: 'Select a video file.' });
+      }
+
+      const ext = path.extname(req.file.originalname).toLowerCase();
+      const contentTypes = {
+        '.mp4': 'video/mp4',
+        '.webm': 'video/webm',
+        '.ogg': 'video/ogg'
+      };
+
+      uploadedBlobName = `${require('crypto').randomUUID()}${ext}`;
+
+      const blockBlobClient =
+        videoBlobContainer.getBlockBlobClient(uploadedBlobName);
+
+      await blockBlobClient.uploadFile(req.file.path, {
+        blobHTTPHeaders: {
+          blobContentType: contentTypes[ext]
+        }
+      });
+
+      res.status(201).json({
+        video_url: `azureblob:${uploadedBlobName}`
+      });
+    } catch (err) {
+      if (uploadedBlobName) {
+        try {
+          await videoBlobContainer.deleteBlob(uploadedBlobName);
+        } catch (_) {}
+      }
+
+      console.error('Azure video upload failed:', err.message);
+      return res.status(500).json({
+        error: 'Video upload failed. Check Azure Storage access and server logs.'
+      });
+    } finally {
+      if (req.file) {
+        await fs.promises.unlink(req.file.path).catch(() => {});
+      }
+    }
+  })
+);
 app.get('/api/health', wrap(async (q, s) => { await db.query('SELECT 1'); s.json({ ok: true }); }));
 
 /* Auth */
@@ -601,8 +736,15 @@ if (l.lab) {
   );
 }
 
-s.json(l);
-}));
+if (l.video_url && l.video_url.startsWith('azureblob:')) {
+  l.video_url = await getPlayableVideoUrl(l.video_url);
+}
+
+if (l.lab && l.lab.video_url && l.lab.video_url.startsWith('azureblob:')) {
+  l.lab.video_url = await getPlayableVideoUrl(l.lab.video_url);
+}
+
+s.json(l);}));
 app.get('/api/students/me/courses', auth('student'), wrap(async (q, s) => {
   s.json((await db.query(`SELECT c.course_id, c.title, c.category,
     (SELECT COUNT(*) FROM lessons WHERE course_id=c.course_id) AS lessons,

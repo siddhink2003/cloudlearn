@@ -40,8 +40,16 @@ async function insV() {
         <label for="lt2">Lesson title</label>
         <input id="lt2" placeholder="Lesson title">
 
-        <label for="lv">Lecture video URL</label>
-        <input id="lv" placeholder="YouTube URL or direct video URL">
+        <label for="lv">Lecture video URL (optional)</label>
+<input id="lv" placeholder="Paste YouTube or direct video URL">
+
+<label for="videoFile">Or upload a video (MP4, WebM, Ogg)</label>
+<input
+  id="videoFile"
+  type="file"
+  accept="video/mp4,video/webm,video/ogg"
+>
+<p class="mu">Choose either a video URL or a video file.</p>
 
         <h4>Study materials</h4>
         <input id="lm" placeholder="Study material title (optional)">
@@ -217,6 +225,39 @@ const ac = () => act(async () => {
 
 const al = () => act(async () => {
   const lessonTitle = document.querySelector('#lt2').value.trim();
+  const courseId = document.querySelector('#lc').value;
+const videoFile = document.querySelector('#videoFile').files[0];
+let videoUrl = document.querySelector('#lv').value.trim();
+
+if (videoFile && videoUrl) {
+  throw new Error('Enter a video URL or select a video file, not both.');
+}
+
+if (videoFile) {
+  const formData = new FormData();
+  formData.append('video', videoFile);
+
+  const token = localStorage.getItem('cl_tok');
+
+  const response = await fetch(
+    '/api/courses/' + courseId + '/video-upload',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + token
+      },
+      body: formData
+    }
+  );
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    throw new Error(result.error || 'Video upload failed.');
+  }
+
+  videoUrl = result.video_url;
+}
   const labTitle = document.querySelector('#ll').value.trim();
   const codeEnabled = document.querySelector('#code-enabled').checked;
 
@@ -292,7 +333,7 @@ const al = () => act(async () => {
 
   const lessonData = {
     title: lessonTitle,
-    video_url: document.querySelector('#lv').value.trim(),
+    video_url: videoUrl,
 
     materials: [{
       title: document.querySelector('#lm').value.trim(),
